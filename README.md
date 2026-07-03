@@ -7,7 +7,7 @@ A pi extension that lets the model ask the user one or more multiple-choice ques
 ```bash
 pi install npm:pi-ask-user
 # or from git:
-pi install git:github.com:you/pi-ask-user
+pi install git:github.com/PetrYako/pi-ask-user
 ```
 
 ## Usage

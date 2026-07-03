@@ -13,7 +13,7 @@
  * cancellation marker and stops or picks a sensible default.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { Input, Key, matchesKey, Text, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { Component } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
@@ -59,32 +59,10 @@ type AskAnswer = {
 	comment?: string;
 };
 
-// Minimum ctx.ui shape this extension needs. Defined locally so we don't
-// have to import the full ExtensionUIContext (and so the helpers stay easy
-// to unit-test with a fake ctx). The askTUI shape matches the part of pi-tui's
-// TUI we actually call (requestRender) so the types line up with the real one.
-type askTUI = { requestRender(force?: boolean): void };
-type askTheme = {
-	fg(color: string, text: string): string;
-	bold(text: string): string;
-};
-type askKeybindings = unknown;
-
-type AskUI = {
-	select(title: string, options: string[]): Promise<string | undefined>;
-	input(
-		title: string,
-		placeholder?: string,
-	): Promise<string | undefined>;
-	custom<T>(
-		factory: (
-			tui: askTUI,
-			theme: askTheme,
-			keybindings: askKeybindings,
-			done: (result: T) => void,
-		) => Component & { focused?: boolean },
-	): Promise<T>;
-};
+// The picker talks to the real ExtensionUIContext (so theme colors, the
+// custom() factory contract, and requestRender are all compile-checked
+// against pi's types). For unit tests, inject any object that satisfies
+// { ui: ExtensionUIContext } structurally.
 
 type AskDetails = {
 	answers: AskAnswer[];
@@ -149,16 +127,20 @@ function printQuestionsForNoUI(questions: Question[]): string {
 // to the previous/next question (the current note is saved automatically);
 // Enter on the last question commits all answers; Esc cancels everything.
 
-type Focus = { kind: "choice"; index: number } | { kind: "input" };
+// focusTarget tracks whether the highlight is on the choices or the note
+// input. The highlighted choice row lives in QuestionState.choiceIndex so it
+// persists per question — there's no separate local cursor to keep in sync.
+type FocusTarget = "choice" | "input";
 
 type QuestionState = {
 	question: Question;
 	checked: boolean[];
 	note: string;
+	choiceIndex: number;
 };
 
 async function runPicker(
-	ctx: { ui: AskUI },
+	ctx: { ui: ExtensionUIContext },
 	questions: Question[],
 	signal: AbortSignal | undefined,
 ): Promise<AskAnswer[] | undefined> {
@@ -166,13 +148,13 @@ async function runPicker(
 		question: q,
 		checked: q.options.map(() => false),
 		note: "",
+		choiceIndex: 0,
 	}));
 
 	return ctx.ui.custom<AskAnswer[] | undefined>((tui, theme, _kb, done) => {
 		const input = new Input();
 		let currentIndex = 0;
-		let cursor = 0;
-		let focus: Focus = { kind: "choice", index: 0 };
+		let focusTarget: FocusTarget = "choice";
 
 		// Guard against double-done if both Esc and abort signal fire.
 		let finished = false;
@@ -205,8 +187,9 @@ async function runPicker(
 		function loadCurrent() {
 			input.setValue(states[currentIndex].note);
 			input.invalidate();
-			cursor = 0;
-			focus = { kind: "choice", index: 0 };
+			// choiceIndex is restored from per-question state, so returning to a
+			// question keeps the highlight where the user left it.
+			focusTarget = "choice";
 		}
 		loadCurrent();
 
@@ -249,7 +232,8 @@ async function runPicker(
 		}
 
 		function handleChoiceKey(data: string): boolean {
-			const opts = states[currentIndex].question.options;
+			const state = states[currentIndex];
+			const opts = state.question.options;
 			if (matchesKey(data, Key.left)) {
 				goBack();
 				return true;
@@ -262,28 +246,27 @@ async function runPicker(
 				return true;
 			}
 			if (matchesKey(data, Key.up)) {
-				cursor = Math.max(0, cursor - 1);
-				focus = { kind: "choice", index: cursor };
+				state.choiceIndex = Math.max(0, state.choiceIndex - 1);
 				refresh();
 				return true;
 			}
 			if (matchesKey(data, Key.down)) {
-				if (cursor < opts.length - 1) {
-					cursor++;
-					focus = { kind: "choice", index: cursor };
+				if (state.choiceIndex < opts.length - 1) {
+					state.choiceIndex++;
 				} else {
-					focus = { kind: "input" };
+					focusTarget = "input";
 				}
 				refresh();
 				return true;
 			}
 			if (matchesKey(data, Key.tab)) {
-				focus = { kind: "input" };
+				focusTarget = "input";
 				refresh();
 				return true;
 			}
 			if (matchesKey(data, Key.space)) {
-				states[currentIndex].checked[cursor] = !states[currentIndex].checked[cursor];
+				const ci = state.choiceIndex;
+				state.checked[ci] = !state.checked[ci];
 				refresh();
 				return true;
 			}
@@ -301,12 +284,13 @@ async function runPicker(
 				else commitAll();
 				return true;
 			}
-			// Tab/Up move focus back to the choices (preserves typed text).
+			// Tab/Up move focus back to the choices (preserves typed text and
+			// the highlighted choice row).
 			if (
 				matchesKey(data, Key.tab) ||
 				matchesKey(data, Key.up)
 			) {
-				focus = { kind: "choice", index: cursor };
+				focusTarget = "choice";
 				refresh();
 				return true;
 			}
@@ -321,7 +305,7 @@ async function runPicker(
 		}
 
 		function handleInputKeyStroke(data: string) {
-			if (focus.kind === "choice") {
+			if (focusTarget === "choice") {
 				if (!handleChoiceKey(data) && matchesKey(data, Key.escape)) {
 					safeDone(undefined);
 				}
@@ -382,7 +366,7 @@ async function runPicker(
 			lines.push("");
 
 			for (let i = 0; i < state.question.options.length; i++) {
-				const isFocused = focus.kind === "choice" && focus.index === i;
+				const isFocused = focusTarget === "choice" && state.choiceIndex === i;
 				const marker = isFocused ? theme.fg("accent", "> ") : "  ";
 				const isPicked = state.checked[i];
 				const box = isPicked ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
@@ -398,7 +382,7 @@ async function runPicker(
 			}
 
 			lines.push("");
-			const inputFocused = focus.kind === "input";
+			const inputFocused = focusTarget === "input";
 			const inputMarker = inputFocused ? theme.fg("accent", "> ") : "  ";
 			const inputLabel = `${inputMarker}Note: `;
 			const inputValue = input.getValue();
@@ -414,8 +398,13 @@ async function runPicker(
 			addWrappedWithPrefix("    ", inputLine);
 
 			lines.push("");
-			const navHint = showProgress ? "← → question • " : "";
-			const hint = `${navHint}↑↓ / Tab move • Space toggle • Enter submit • Esc cancel`;
+			// Hint reflects current focus: ←/→ switch questions only from the
+			// choices. While the note input is focused they move the caret, so
+			// point the user at Tab/↑ to leave the input first.
+			const hint =
+				focusTarget === "input"
+					? "Tab/↑ back to choices • Enter submit • Esc cancel"
+					: `${showProgress ? "← → question • " : ""}↑↓ / Tab move • Space toggle • Enter submit • Esc cancel`;
 			addWrappedWithPrefix(" ", theme.fg("dim", hint));
 			lines.push(theme.fg("accent", "─".repeat(renderWidth)));
 
@@ -425,7 +414,10 @@ async function runPicker(
 		// Focusable: propagate focus state to the embedded Input so it emits
 		// CURSOR_MARKER and IME candidate windows get positioned correctly.
 		let _focused = false;
-		return {
+		// Returned through a typed const so the focused get/set pair is allowed
+		// (a fresh object literal returned directly would trip excess-property
+		// checks against Component, which has no `focused` property).
+		const component: Component & { dispose?: () => void; focused?: boolean } = {
 			render,
 			invalidate: refresh,
 			handleInput: handleInputKeyStroke,
@@ -437,6 +429,7 @@ async function runPicker(
 				input.focused = value;
 			},
 		};
+		return component;
 	});
 }
 
@@ -464,7 +457,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!ctx.hasUI) {
-				// Surface the question(s) as text and bail out.
+				// Surface the question(s) as text. Not an error — the model can
+				// still proceed with a sensible default — we just couldn't collect
+				// answers without an interactive UI.
 				const questionsText = printQuestionsForNoUI(params.questions);
 				return {
 					content: [
@@ -472,12 +467,11 @@ export default function (pi: ExtensionAPI) {
 							type: "text",
 							text:
 								questionsText + "\n\n" +
-								"ask_user requires an interactive UI (TUI or RPC mode). " +
-								"The questions were surfaced but no answers could be collected. " +
-								"Make a reasonable default choice or ask the user to switch to interactive mode.",
+								"ask_user requires an interactive UI (TUI or RPC mode); " +
+								"no answers could be collected. Proceed with a sensible " +
+								"default, or ask the user to re-run in interactive mode.",
 						},
 					],
-					isError: true,
 					details: { answers: [], cancelled: false } as AskDetails,
 				};
 			}
