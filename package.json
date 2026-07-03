@@ -1,6 +1,6 @@
 {
   "name": "pi-ask-user",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Ask the user multi-choice questions from a pi agent and wait for their answer.",
   "keywords": ["pi-package"],
   "license": "MIT",

@@ -1,15 +1,13 @@
 /**
  * Ask User Tool
  *
- * Lets the model ask the user one or more multiple-choice questions and
- * block until they answer (or cancel). Each call may carry one or more
- * questions; each question has at least 2 options. The picker is always
- * multi-select and always shows a free-text "Note" input alongside the
- * choices, so the user can add free-form context to whatever they ticked
- * (or use it on its own if none of the choices fit).
+ * Lets the model ask the user one or more questions and block until they
+ * answer (or cancel). Each question is either multiple-choice (2+ options,
+ * multi-select) or free-text (no options — a pure clarification). Either
+ * way the user can also type a free-form note/answer alongside a selection.
  *
- * The result carries the selected option labels plus the typed note
- * (if any). If the user cancelled the picker, the model receives a
+ * The result carries the selected option labels (if any) and the typed
+ * text (if any). If the user cancelled the picker, the model receives a
  * cancellation marker and stops or picks a sensible default.
  */
 
@@ -19,21 +17,23 @@ import type { Component } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 
 const OptionSchema = Type.Object({
-	label: Type.String({ description: "Short label shown in the picker" }),
+	label: Type.String({ description: "Short label for the option" }),
 	description: Type.Optional(
-		Type.String({ description: "One-line explanation shown under the label" }),
+		Type.String({ description: "One-line explanation of the option" }),
 	),
 });
 
 const QuestionSchema = Type.Object({
-	question: Type.String({ description: "The question to ask the user" }),
+	question: Type.String({ description: "The question to ask" }),
 	header: Type.Optional(
-		Type.String({ description: "Optional short label shown above the question" }),
+		Type.String({ description: "Optional short label for the question" }),
 	),
-	options: Type.Array(OptionSchema, {
-		description: "Options the user can pick from (at least 2)",
-		minItems: 2,
-	}),
+	options: Type.Optional(
+		Type.Array(OptionSchema, {
+			description: "Choices for a multiple-choice question (2+). Omit for a free-text answer.",
+			minItems: 2,
+		}),
+	),
 });
 
 const AskUserParams = Type.Object({
@@ -69,19 +69,19 @@ type AskDetails = {
 	cancelled: boolean;
 };
 
-// Only shape constraints the picker actually needs: non-empty labels,
-// at least 2 options (a choice with 1 option is not a choice), unique
-// labels (otherwise select() would return ambiguous matches). Everything
-// else — question length, label length, description length — is left to
-// the model since the user sees it, not the model.
+// Only shape constraints the picker actually needs: a non-empty question,
+// and — when options are given — at least 2 of them with non-empty unique
+// labels (one option isn't a choice; duplicate labels would be ambiguous).
+// options may be omitted entirely for a free-text question. Everything else
+// (lengths, wording) is left to the model since the user sees it, not pi.
 function validateQuestions(questions: Question[]): string | null {
 	for (let i = 0; i < questions.length; i++) {
 		const q = questions[i];
 		if (!q.question.trim()) {
 			return `questions[${i}].question must not be empty`;
 		}
-		if (q.options.length < 2) {
-			return `questions[${i}].options must have at least 2 entries`;
+		if (q.options.length === 1) {
+			return `questions[${i}].options must have at least 2 entries, or be omitted for a free-text question`;
 		}
 		const seen = new Set<string>();
 		for (let j = 0; j < q.options.length; j++) {
@@ -112,20 +112,20 @@ function printQuestionsForNoUI(questions: Question[]): string {
 		for (const o of q.options) {
 			lines.push(`  - ${o.label}${o.description ? ` — ${o.description}` : ""}`);
 		}
-		lines.push("  - Note (optional free text)");
+		lines.push(q.options.length > 0 ? "  - Note (optional free text)" : "  (free-text answer)");
 	}
 	return lines.join("\n");
 }
 
-// The picker renders the choices as checkboxes plus a text input labelled
-// "Note" at the bottom. The input is always part of the same pick —
-// there's no separate follow-up input — so the user can add a free-text
-// note alongside any ticked choices in one go.
+// The picker renders checkboxes for a multiple-choice question, or just a
+// text input for a free-text question. The text input is always present
+// ("Note" for multiple-choice, "Answer" for free-text) so the user can add
+// free-form context in the same step.
 //
 // For multi-question calls, each question has its own state (selections +
-// note) and the user can move freely between them. ← → from a choice moves
-// to the previous/next question (the current note is saved automatically);
-// Enter on the last question commits all answers; Esc cancels everything.
+// note) and the user can move freely between them: ← → from a choice, or
+// ↑/↓ while answering a free-text question. Enter on the last question
+// commits all answers; Esc cancels everything.
 
 // focusTarget tracks whether the highlight is on the choices or the note
 // input. The highlighted choice row lives in QuestionState.choiceIndex so it
@@ -187,9 +187,10 @@ async function runPicker(
 		function loadCurrent() {
 			input.setValue(states[currentIndex].note);
 			input.invalidate();
-			// choiceIndex is restored from per-question state, so returning to a
-			// question keeps the highlight where the user left it.
-			focusTarget = "choice";
+			// Start on the choices when there are any, otherwise the text input
+			// (free-text question). choiceIndex is restored from per-question
+			// state, so returning to a question keeps the highlight where it was.
+			focusTarget = states[currentIndex].question.options.length > 0 ? "choice" : "input";
 		}
 		loadCurrent();
 
@@ -279,24 +280,34 @@ async function runPicker(
 		}
 
 		function handleInputKey(data: string): boolean {
+			const hasOptions = states[currentIndex].question.options.length > 0;
 			if (matchesKey(data, Key.enter)) {
 				if (currentIndex < states.length - 1) advance();
 				else commitAll();
 				return true;
 			}
-			// Tab/Up move focus back to the choices (preserves typed text and
-			// the highlighted choice row).
-			if (
-				matchesKey(data, Key.tab) ||
-				matchesKey(data, Key.up)
-			) {
-				focusTarget = "choice";
-				refresh();
-				return true;
-			}
 			// Esc cancels from the input too — matches the on-screen hint.
 			if (matchesKey(data, Key.escape)) {
 				safeDone(undefined);
+				return true;
+			}
+			if (!hasOptions) {
+				// Free-text question (no choices to return to): ↑/↓ navigate
+				// between questions. Everything else, including ←/→ for caret
+				// movement, goes to the text input.
+				if (matchesKey(data, Key.up)) {
+					goBack();
+					return true;
+				}
+				if (matchesKey(data, Key.down)) {
+					advance();
+					return true;
+				}
+			} else if (matchesKey(data, Key.tab) || matchesKey(data, Key.up)) {
+				// Tab/Up move focus back to the choices (preserves typed text and
+				// the highlighted choice row).
+				focusTarget = "choice";
+				refresh();
 				return true;
 			}
 			input.handleInput(data);
@@ -365,26 +376,27 @@ async function runPicker(
 			addWrappedWithPrefix(" ", titleParts.join(" "));
 			lines.push("");
 
-			for (let i = 0; i < state.question.options.length; i++) {
-				const isFocused = focusTarget === "choice" && state.choiceIndex === i;
-				const marker = isFocused ? theme.fg("accent", "> ") : "  ";
-				const isPicked = state.checked[i];
-				const box = isPicked ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
-				const color = isFocused ? "accent" : isPicked ? "text" : "muted";
-				const desc = state.question.options[i].description;
-				const descSuffix = desc
-					? "  " + theme.fg(isFocused ? "muted" : "dim", desc)
-					: "";
-				addWrappedWithPrefix(
-					"    ",
-					theme.fg(color, `${marker}${box} ${state.question.options[i].label}`) + descSuffix,
-				);
+			if (state.question.options.length > 0) {
+				for (let i = 0; i < state.question.options.length; i++) {
+					const isFocused = focusTarget === "choice" && state.choiceIndex === i;
+					const marker = isFocused ? theme.fg("accent", "> ") : "  ";
+					const isPicked = state.checked[i];
+					const box = isPicked ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
+					const color = isFocused ? "accent" : isPicked ? "text" : "muted";
+					const desc = state.question.options[i].description;
+					const descSuffix = desc
+						? "  " + theme.fg(isFocused ? "muted" : "dim", desc)
+						: "";
+					addWrappedWithPrefix(
+						"    ",
+						theme.fg(color, `${marker}${box} ${state.question.options[i].label}`) + descSuffix,
+					);
+				}
+				lines.push("");
 			}
-
-			lines.push("");
 			const inputFocused = focusTarget === "input";
 			const inputMarker = inputFocused ? theme.fg("accent", "> ") : "  ";
-			const inputLabel = `${inputMarker}Note: `;
+			const inputLabel = `${inputMarker}${state.question.options.length > 0 ? "Note" : "Answer"}: `;
 			const inputValue = input.getValue();
 			let inputLine: string;
 			if (inputValue.length > 0) {
@@ -398,13 +410,20 @@ async function runPicker(
 			addWrappedWithPrefix("    ", inputLine);
 
 			lines.push("");
-			// Hint reflects current focus: ←/→ switch questions only from the
-			// choices. While the note input is focused they move the caret, so
-			// point the user at Tab/↑ to leave the input first.
-			const hint =
-				focusTarget === "input"
+			// Hint reflects current focus and question type. ←/→ switch questions
+			// only from the choices (from the text input they move the caret),
+			// so free-text questions use ↑/↓ for navigation instead.
+			const hasOptions = state.question.options.length > 0;
+			let hint: string;
+			if (focusTarget === "input") {
+				hint = hasOptions
 					? "Tab/↑ back to choices • Enter submit • Esc cancel"
-					: `${showProgress ? "← → question • " : ""}↑↓ / Tab move • Space toggle • Enter submit • Esc cancel`;
+					: showProgress
+						? "↑ prev • ↓ next question • Enter submit • Esc cancel"
+						: "Enter submit • Esc cancel";
+			} else {
+				hint = `${showProgress ? "← → question • " : ""}↑↓ / Tab move • Space toggle • Enter submit • Esc cancel`;
+			}
 			addWrappedWithPrefix(" ", theme.fg("dim", hint));
 			lines.push(theme.fg("accent", "─".repeat(renderWidth)));
 
@@ -438,16 +457,29 @@ export default function (pi: ExtensionAPI) {
 		name: "ask_user",
 		label: "Ask User",
 		description:
-			"Ask the user one or more multiple-choice questions and wait for their answer. Each question needs 2+ options; the user picks one or more and can add a free-text note. With multiple questions, the user can navigate between them and revise answers before submitting.",
+			"Ask the user a question and wait for their answer. Use it to clarify " +
+			"intent, get a decision, or confirm a direction you can't safely infer. " +
+			"Provide 2+ options for a multiple-choice question, or omit options for a " +
+			"free-text answer. Returns the selected options and any written answer, " +
+			"or a cancellation marker if the user cancelled.",
 		promptSnippet:
-			"Ask the user a multiple-choice question.",
+			"Ask the user a question (multiple-choice or free-text) and wait for the answer.",
 		promptGuidelines: [
-			"Use ask_user to get a decision or preference from the user before proceeding.",
+			"Use ask_user to clarify ambiguous intent or get a decision before proceeding, rather than guessing.",
+			"Don't use ask_user for anything you can determine yourself by reading files or running commands.",
 		],
 		parameters: AskUserParams,
 
 		async execute(_toolCallId: string, params: Static<typeof AskUserParams>, signal: AbortSignal | undefined, _onUpdate, ctx) {
-			const validationError = validateQuestions(params.questions);
+			// Normalize: options is optional in the schema (omit for a free-text
+			// question). Internally we always carry an options array (empty =
+			// free-text) so the rest of the code doesn't have to null-check.
+			const questions: Question[] = params.questions.map((q) => ({
+				question: q.question,
+				header: q.header,
+				options: q.options ?? [],
+			}));
+			const validationError = validateQuestions(questions);
 			if (validationError !== null) {
 				return {
 					content: [{ type: "text", text: `Invalid ask_user call: ${validationError}` }],
@@ -460,7 +492,7 @@ export default function (pi: ExtensionAPI) {
 				// Surface the question(s) as text. Not an error — the model can
 				// still proceed with a sensible default — we just couldn't collect
 				// answers without an interactive UI.
-				const questionsText = printQuestionsForNoUI(params.questions);
+				const questionsText = printQuestionsForNoUI(questions);
 				return {
 					content: [
 						{
@@ -476,7 +508,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const answers = await runPicker(ctx, params.questions, signal);
+			const answers = await runPicker(ctx, questions, signal);
 			if (answers === undefined) {
 				return {
 					content: [
@@ -492,7 +524,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const summary = answers
-				.map((a) => `${a.question} -> ${picksLabel(a.selected)}${a.comment ? ` (comment: ${a.comment})` : ""}`)
+				.map((a) =>
+					a.options.length === 0
+						? `${a.question} -> ${a.comment ?? "(no answer)"}`
+						: `${a.question} -> ${picksLabel(a.selected)}${a.comment ? ` (note: ${a.comment})` : ""}`,
+				)
 				.join("\n");
 			return {
 				content: [{ type: "text", text: summary }],
@@ -537,19 +573,25 @@ export default function (pi: ExtensionAPI) {
 					blockLines.push(theme.fg("accent", `[${a.header}]`));
 				}
 				blockLines.push(theme.fg("text", a.question));
-				for (const o of a.options) {
-					const picked = a.selected.includes(o.label);
-					const box = picked ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
-					const color = picked ? "text" : "muted";
-					const descSuffix = o.description
-						? "  " + theme.fg("dim", o.description)
-						: "";
-					blockLines.push(`    ${theme.fg(color, `${box} ${o.label}`)}${descSuffix}`);
-				}
-				if (a.comment) {
+				if (a.options.length === 0) {
 					blockLines.push(
-						`    ${theme.fg("dim", "Note: ")}${theme.fg("text", a.comment)}`,
+						`    ${theme.fg("dim", "Answer: ")}${theme.fg("text", a.comment ?? "(no answer)")}`,
 					);
+				} else {
+					for (const o of a.options) {
+						const picked = a.selected.includes(o.label);
+						const box = picked ? theme.fg("success", "[x]") : theme.fg("dim", "[ ]");
+						const color = picked ? "text" : "muted";
+						const descSuffix = o.description
+							? "  " + theme.fg("dim", o.description)
+							: "";
+						blockLines.push(`    ${theme.fg(color, `${box} ${o.label}`)}${descSuffix}`);
+					}
+					if (a.comment) {
+						blockLines.push(
+							`    ${theme.fg("dim", "Note: ")}${theme.fg("text", a.comment)}`,
+						);
+					}
 				}
 				blocks.push(blockLines.join("\n"));
 			}
