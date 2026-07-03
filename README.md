@@ -12,6 +12,8 @@ pi install https://github.com/PetrYako/pi-ask-user
 
 ## Usage
 
+<img width="1427" height="334" alt="Screenshot 2026-07-03 at 17 19 14" src="https://github.com/user-attachments/assets/5ba45b57-e146-422c-80a6-f5ff923cbefd" />
+
 Once installed, the `ask_user` tool is available to the model. The model calls it like any other tool:
 
 ```json
