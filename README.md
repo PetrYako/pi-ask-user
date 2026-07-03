@@ -5,7 +5,7 @@ A pi extension that lets the model ask the user one or more multiple-choice ques
 ## Install
 
 ```bash
-pi install git:github.com:you/pi-ask-user
+pi install git:github.com:PetrYako/pi-ask-user
 ```
 
 ## Usage
